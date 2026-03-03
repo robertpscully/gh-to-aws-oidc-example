@@ -14,6 +14,8 @@ permissions:
 env:
   AWS_REGION: eu-west-2
   TF_VERSION: "1.14.6"
+  PLAN_BUCKET: robertscully-terraform-s3-backend
+  PLAN_KEY: plan-files/run-${{ github.run_id }}.tfplan
 
 jobs:
   terraform-plan:
@@ -37,9 +39,19 @@ jobs:
         working-directory: terraform
         run: terraform init -input=false
 
-      - name: Terraform Plan
+      - name: Terraform Plan (PR)
+        if: github.event_name == 'pull_request'
         working-directory: terraform
         run: terraform plan -input=false
+
+      - name: Terraform Plan (apply run)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        working-directory: terraform
+        run: terraform plan -out=plan.tfplan -input=false
+
+      - name: Upload plan to S3
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: aws s3 cp terraform/plan.tfplan s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }}
 
   approval:
     needs: terraform-plan
@@ -72,6 +84,13 @@ jobs:
         working-directory: terraform
         run: terraform init -input=false
 
+      - name: Download plan from S3
+        run: aws s3 cp s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }} terraform/plan.tfplan
+
       - name: Terraform Apply
         working-directory: terraform
-        run: terraform apply -input=false -auto-approve
+        run: terraform apply -input=false -auto-approve plan.tfplan
+
+      - name: Delete plan from S3
+        if: always()
+        run: aws s3 rm s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }}
