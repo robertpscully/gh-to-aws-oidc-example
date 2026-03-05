@@ -5,21 +5,101 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Allow manual execution from the Actions UI
   workflow_dispatch:
+    inputs:
+      keep_plan:
+        description: 'Keep the plan file in S3 after apply (skips deletion)'
+        type: boolean
+        default: false
 
+# id-token: write is required for the OIDC token exchange with AWS
 permissions:
   contents: read
   id-token: write
 
+# Workflow-level constants. Role ARNs are NOT set here — they are resolved
+# per-stage by the validate-config job from repository variables.
 env:
   AWS_REGION: eu-west-2
   TF_VERSION: "1.14.6"
+  # S3 bucket and key used to hand the plan file between the plan and apply jobs.
+  # The run ID makes the key unique per workflow run and consistent across all jobs.
   PLAN_BUCKET: robertscully-terraform-s3-backend
-  PLAN_KEY: plan-files/run-${{ github.run_id }}.tfplan
+  PLAN_KEY: plan-files/${{ github.repository }}/run-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}.tfplan
 
 jobs:
-  terraform-plan:
+  # ── 1. validate-config ────────────────────────────────────────────────────
+  # Runs first, before any AWS or Terraform interaction. Reads repository
+  # variables, validates the role ARN configuration, and resolves the correct
+  # ARN for each stage (plan / apply).
+  #
+  # Role ARN configuration rules:
+  #
+  #   Simple   — set AWS_ROLE_ARN.
+  #              The same role is used for both the plan and apply stages.
+  #
+  #   Advanced — set AWS_ROLE_ARN_PLAN and AWS_ROLE_ARN_APPLY.
+  #              Both must be set together; setting only one is an error.
+  #
+  # If no valid configuration is found the workflow fails before any runner
+  # performs any action, and all errors are emitted as annotations.
+  validate-config:
     runs-on: ubuntu-latest
+    outputs:
+      role_plan:  ${{ steps.resolve.outputs.role_plan }}
+      role_apply: ${{ steps.resolve.outputs.role_apply }}
+    steps:
+      - name: Resolve role configuration
+        id: resolve
+        run: |
+          role_plan="${{ vars.AWS_ROLE_ARN_PLAN }}"
+          role_apply="${{ vars.AWS_ROLE_ARN_APPLY }}"
+          role="${{ vars.AWS_ROLE_ARN }}"
+          errors=()
+
+          # Resolve role ARN
+          if [[ -n "$role_plan" ]] || [[ -n "$role_apply" ]]; then
+            # Stage-specific mode: both _PLAN and _APPLY must be present
+            if [[ -z "$role_plan" ]] || [[ -z "$role_apply" ]]; then
+              errors+=("When using stage-specific role ARNs, both AWS_ROLE_ARN_PLAN and AWS_ROLE_ARN_APPLY must be set.")
+            else
+              resolved_plan="$role_plan"
+              resolved_apply="$role_apply"
+            fi
+          elif [[ -n "$role" ]]; then
+            # Simple mode: same role for both stages
+            resolved_plan="$role"
+            resolved_apply="$role"
+          else
+            errors+=("No role ARN configured. Set AWS_ROLE_ARN for all stages, or both AWS_ROLE_ARN_PLAN and AWS_ROLE_ARN_APPLY.")
+          fi
+
+          # Emit all errors as annotations before failing
+          if [[ ${#errors[@]} -gt 0 ]]; then
+            for error in "${errors[@]}"; do
+              echo "::error::$error"
+            done
+            exit 1
+          fi
+
+          echo "role_plan=$resolved_plan"   >> $GITHUB_OUTPUT
+          echo "role_apply=$resolved_apply" >> $GITHUB_OUTPUT
+
+  # ── 2. terraform-plan ─────────────────────────────────────────────────────
+  # Authenticates to AWS using the plan-stage role resolved above, then
+  # runs terraform init and plan.
+  #
+  # On pull requests: plan output goes to the job log only (no file written).
+  # On push to main:  plan is written to a file and uploaded to S3 for the
+  #                   apply job to consume. If there are no changes the
+  #                   has_changes output is set to false, which causes the
+  #                   approval and apply jobs to be skipped automatically.
+  terraform-plan:
+    needs: validate-config
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,7 +107,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ needs.validate-config.outputs.role_plan }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
@@ -42,28 +122,48 @@ jobs:
       - name: Terraform Plan (PR)
         if: github.event_name == 'pull_request'
         working-directory: terraform
+        # PR plans are for visibility only — no output file is written
         run: terraform plan -input=false
 
       - name: Terraform Plan (apply run)
+        id: plan
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         working-directory: terraform
-        run: terraform plan -out=plan.tfplan -input=false
+        run: |
+          set +e
+          # -detailed-exitcode: exit 0 = no changes, exit 2 = changes, exit 1 = error
+          terraform plan -out=plan.tfplan -detailed-exitcode -input=false
+          exit_code=$?
+          if [ $exit_code -eq 1 ]; then exit 1; fi
+          echo "has_changes=$([ $exit_code -eq 2 ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
 
       - name: Upload plan to S3
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && steps.plan.outputs.has_changes == 'true'
+        # Keyed by run ID so the apply job can locate it without coordination
         run: aws s3 cp terraform/plan.tfplan s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }}
 
+  # ── 3. approval ───────────────────────────────────────────────────────────
+  # Pauses the pipeline and waits for a reviewer to approve via the GitHub
+  # Actions UI. Skipped entirely when there are no infrastructure changes.
+  # Reviewers are configured under Settings → Environments → production.
   approval:
     needs: terraform-plan
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.terraform-plan.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     environment: production
     steps:
       - name: Approved
         run: echo "Deployment approved — proceeding with apply"
 
+  # ── 4. terraform-apply ────────────────────────────────────────────────────
+  # Downloads the plan file produced by terraform-plan, then applies it.
+  # Uses the apply-stage role which may have broader write permissions
+  # than the plan-stage role.
+  # The plan file is deleted from S3 after apply, even on failure.
   terraform-apply:
-    needs: approval
+    # Explicitly lists validate-config so its outputs are accessible here,
+    # since it is not a direct parent of this job (approval sits between them).
+    needs: [approval, validate-config]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -72,7 +172,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ needs.validate-config.outputs.role_apply }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
@@ -92,5 +192,7 @@ jobs:
         run: terraform apply -input=false -auto-approve plan.tfplan
 
       - name: Delete plan from S3
-        if: always()
+        # Always runs so the plan file is removed even if apply fails,
+        # unless keep_plan was set to true on a manual workflow_dispatch run.
+        if: always() && inputs.keep_plan != true && vars.KEEP_PLAN != 'true'
         run: aws s3 rm s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }}
