@@ -114,6 +114,10 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+          # Disable the wrapper so that -detailed-exitcode exit codes (0/1/2)
+          # are passed through directly to the shell — the wrapper can swallow
+          # exit code 2, causing has_changes to always evaluate as false.
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: terraform
