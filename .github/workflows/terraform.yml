@@ -8,6 +8,10 @@ on:
   # Allow manual execution from the Actions UI
   workflow_dispatch:
     inputs:
+      workspace_id:
+        description: 'Workspace identifier for state isolation. Determines which state file and IAM role are used. Must match a workspace registered in terraform/devops-infra.'
+        type: string
+        default: default
       keep_plan:
         description: 'Keep the plan file in S3 after apply (skips deletion)'
         type: boolean
@@ -23,10 +27,22 @@ permissions:
 env:
   AWS_REGION: eu-west-2
   TF_VERSION: "1.14.6"
-  # S3 bucket and key used to hand the plan file between the plan and apply jobs.
-  # The run ID makes the key unique per workflow run and consistent across all jobs.
-  PLAN_BUCKET: robertscully-terraform-s3-backend
-  PLAN_KEY: plan-files/${{ github.repository }}/run-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}.tfplan
+
+  # Workspace identifier. Defaults to 'default' for push events.
+  # Override via the workspace_id input on workflow_dispatch runs.
+  # Must match a workspace registered in terraform/devops-infra/pipelines.tf.
+  WORKSPACE_ID: ${{ inputs.workspace_id || 'default' }}
+
+  # S3 bucket used for both Terraform state (via the backend) and ephemeral
+  # plan file handoff between the plan and apply jobs.
+  # Set PLAN_BUCKET as a repository variable (Settings → Actions → Variables)
+  # to the name of the shared state bucket created by terraform/devops-infra.
+  PLAN_BUCKET: ${{ vars.PLAN_BUCKET }}
+
+  # Plan file key — unique per run and consistent across all jobs in the run.
+  # Scoped under plan-files/<org>/<repo>/<workspace>/ to match the IAM policy
+  # created for this repository by terraform/devops-infra/modules/pipeline-iam.
+  PLAN_KEY: plan-files/${{ github.repository }}/${{ inputs.workspace_id || 'default' }}/run-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}.tfplan
 
 jobs:
   # ── 1. validate-config ────────────────────────────────────────────────────
@@ -120,19 +136,24 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init
-        working-directory: terraform
-        run: terraform init -input=false
+        working-directory: terraform/app
+        # The backend key is injected here rather than hardcoded in backend.tf,
+        # so that each workspace gets its own isolated state file in the shared
+        # S3 bucket: state/<org>/<repo>/<workspace>/terraform.tfstate
+        run: |
+          terraform init -input=false \
+            -backend-config="key=state/${{ github.repository }}/${{ env.WORKSPACE_ID }}/terraform.tfstate"
 
       - name: Terraform Plan (PR)
         if: github.event_name == 'pull_request'
-        working-directory: terraform
+        working-directory: terraform/app
         # PR plans are for visibility only — no output file is written
         run: terraform plan -input=false
 
       - name: Terraform Plan (apply run)
         id: plan
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        working-directory: terraform
+        working-directory: terraform/app
         run: |
           set +e
           # -detailed-exitcode: exit 0 = no changes, exit 2 = changes, exit 1 = error
@@ -144,7 +165,7 @@ jobs:
       - name: Upload plan to S3
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && steps.plan.outputs.has_changes == 'true'
         # Keyed by run ID so the apply job can locate it without coordination
-        run: aws s3 cp terraform/plan.tfplan s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }}
+        run: aws s3 cp terraform/app/plan.tfplan s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }}
 
   # ── 3. approval ───────────────────────────────────────────────────────────
   # Pauses the pipeline and waits for a reviewer to approve via the GitHub
@@ -185,14 +206,16 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Terraform Init
-        working-directory: terraform
-        run: terraform init -input=false
+        working-directory: terraform/app
+        run: |
+          terraform init -input=false \
+            -backend-config="key=state/${{ github.repository }}/${{ env.WORKSPACE_ID }}/terraform.tfstate"
 
       - name: Download plan from S3
-        run: aws s3 cp s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }} terraform/plan.tfplan
+        run: aws s3 cp s3://${{ env.PLAN_BUCKET }}/${{ env.PLAN_KEY }} terraform/app/plan.tfplan
 
       - name: Terraform Apply
-        working-directory: terraform
+        working-directory: terraform/app
         run: terraform apply -input=false -auto-approve plan.tfplan
 
       - name: Delete plan from S3
